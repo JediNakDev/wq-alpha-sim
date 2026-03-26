@@ -178,9 +178,20 @@ def start_session() -> SingleSession:
 
             while True:
                 if s.post(urljoin(r.url, r.headers["Location"])).status_code != 201:
-                    input(
-                        "Biometrics authentication is not complete. Please try again and press any key when completed \n"
-                    )
+                    # Generate a fresh biometric link (old one may have expired)
+                    r = s.post(brain_api_url + "/authentication")
+                    if r.status_code == requests.status_codes.codes.unauthorized and r.headers.get("WWW-Authenticate") == "persona":
+                        print(
+                            "\nBiometrics not verified. Here is a new link:\n"
+                            + urljoin(r.url, r.headers["Location"])
+                            + "\n"
+                            + "Complete it and press any key to continue.\n"
+                        )
+                    else:
+                        print(
+                            "\nBiometrics authentication is not complete. Please try again and press any key when completed.\n"
+                        )
+                    input()
                 else:
                     break
         else:

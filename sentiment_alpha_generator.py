@@ -1,40 +1,24 @@
 """
-Program 1: Sentiment Alpha Generator
-=====================================
-Fetches sentiment datafields from the API, classifies them as
-positive/negative, then generates all alpha expression combinations
-using curated operators and saves them for simulation.
+Sentiment Alpha Generator
+=========================
+Fetches sentiment datafields, classifies them as positive/negative,
+and generates all alpha expression combinations.
 
 Usage:
     python3 sentiment_alpha_generator.py
-
-Output:
-    generated_alphas.jsonl  — one alpha dict per line (compact)
+    python3 sentiment_alpha_generator.py --region USA --universe TOP3000 --delay 1
 """
 
+import argparse
 import itertools
-import json
-import os
 import sys
 
-import pandas as pd
+from ace_lib import get_datafields, get_operators, start_session
+from alpha_choices import pick_region_universe_delay
+from alpha_pipeline import alphas_dir_for, build_settings, write_alphas_jsonl
 
-from ace_lib import (
-    generate_alpha,
-    get_datafields,
-    get_operators,
-    start_session,
-)
+# ── Curated operators ─────────────────────────────────────────
 
-# ── curated operators (only ones that make sense for sentiment template) ──────
-#
-# Backfill ops: smooth/fill sparse sentiment data before ranking
-#   ts_backfill  — fill NaN gaps in sentiment data (essential)
-#   ts_mean      — simple rolling average, basic smoother
-#   ts_decay_linear — weighted avg favoring recent days, great for sentiment
-#   ts_sum       — accumulate sentiment signal over window
-#   ts_av_diff   — deviation from mean (x - ts_mean(x,d)), captures surprise
-#
 BACKFILL_OPS = [
     "ts_backfill",
     "ts_mean",
@@ -43,24 +27,11 @@ BACKFILL_OPS = [
     "ts_av_diff",
 ]
 
-# Compare ops: compute difference between positive vs negative sentiment
-#   subtract — direct difference (pos - neg), preserves magnitude
-#   divide   — ratio (pos / neg), captures relative strength
-#
 COMPARE_OPS = [
     "subtract",
     "divide",
 ]
 
-# Time series ops: final transformation on the sentiment difference signal
-#   ts_delta        — momentum/change in sentiment diff
-#   ts_zscore       — how unusual is current diff vs recent history
-#   ts_rank         — where does current diff rank in recent window
-#   ts_decay_linear — smoothed trend of sentiment diff
-#   ts_mean         — average sentiment diff over window
-#   ts_scale        — normalize to 0-1 range
-#   ts_ir           — information ratio (mean/stddev), signal-to-noise
-#
 TIME_SERIES_OPS = [
     "ts_delta",
     "ts_zscore",
@@ -73,9 +44,7 @@ TIME_SERIES_OPS = [
 
 DAYS = [5, 20, 60, 250]
 
-OUTPUT_DIR = "generated_alphas"
-
-# ── sentiment classification keywords ────────────────────────────────────────
+# ── Sentiment classification ──────────────────────────────────
 
 POSITIVE_KEYWORDS = [
     "bull", "buy", "upgrad", "positive", "optimis", "long", "strong",
@@ -97,51 +66,42 @@ NEGATIVE_KEYWORDS = [
 
 
 def classify_sentiment(field_id: str, field_desc: str) -> str | None:
-    """Classify a datafield as 'positive', 'negative', or None (ambiguous)."""
     text = (field_id + " " + str(field_desc)).lower()
-
-    pos_score = sum(1 for kw in POSITIVE_KEYWORDS if kw in text)
-    neg_score = sum(1 for kw in NEGATIVE_KEYWORDS if kw in text)
-
-    if pos_score > neg_score:
+    pos = sum(1 for kw in POSITIVE_KEYWORDS if kw in text)
+    neg = sum(1 for kw in NEGATIVE_KEYWORDS if kw in text)
+    if pos > neg:
         return "positive"
-    if neg_score > pos_score:
+    if neg > pos:
         return "negative"
     return None
 
 
-def get_sentiment_fields(s) -> tuple[list[str], list[str]]:
-    """Fetch sentiment datafields and split into positive / negative lists."""
+def get_sentiment_fields(s, region: str, universe: str) -> tuple[list[str], list[str]]:
     print("Fetching sentiment datafields...")
-    df = get_datafields(s, search="sentiment")
-
+    df = get_datafields(s, region=region, universe=universe, search="sentiment")
     if df.empty:
         print("WARNING: No sentiment datafields found")
         return [], []
 
     positive, negative = [], []
-
     for _, row in df.iterrows():
         field_id = row.get("id", row.get("name", ""))
         desc = row.get("description", "")
-        classification = classify_sentiment(str(field_id), str(desc))
-
-        if classification == "positive":
+        cls = classify_sentiment(str(field_id), str(desc))
+        if cls == "positive":
             positive.append(str(field_id))
-        elif classification == "negative":
+        elif cls == "negative":
             negative.append(str(field_id))
         else:
-            # ambiguous fields go into both lists so no data is lost
             positive.append(str(field_id))
             negative.append(str(field_id))
 
-    print(f"  Positive sentiment fields ({len(positive)}): {positive[:5]}{'...' if len(positive) > 5 else ''}")
-    print(f"  Negative sentiment fields ({len(negative)}): {negative[:5]}{'...' if len(negative) > 5 else ''}")
+    print(f"  Positive ({len(positive)}): {positive[:5]}{'...' if len(positive) > 5 else ''}")
+    print(f"  Negative ({len(negative)}): {negative[:5]}{'...' if len(negative) > 5 else ''}")
     return positive, negative
 
 
 def get_filtered_operators(s) -> tuple[list[str], list[str], list[str]]:
-    """Validate curated operators exist on the platform."""
     print("Validating operators against platform...")
     df = get_operators(s)
     all_ops = set(df["name"].unique()) if "name" in df.columns else set(df.iloc[:, 0].unique())
@@ -150,88 +110,78 @@ def get_filtered_operators(s) -> tuple[list[str], list[str], list[str]]:
     compare = [op for op in COMPARE_OPS if op in all_ops]
     ts = [op for op in TIME_SERIES_OPS if op in all_ops]
 
-    missing_bf = set(BACKFILL_OPS) - set(backfill)
-    missing_cmp = set(COMPARE_OPS) - set(compare)
-    missing_ts = set(TIME_SERIES_OPS) - set(ts)
+    missing = (set(BACKFILL_OPS) - set(backfill)) | (set(COMPARE_OPS) - set(compare)) | (set(TIME_SERIES_OPS) - set(ts))
+    if missing:
+        print(f"  WARNING: ops not on platform: {missing}")
 
-    if missing_bf:
-        print(f"  WARNING: backfill ops not on platform: {missing_bf}")
-    if missing_cmp:
-        print(f"  WARNING: compare ops not on platform: {missing_cmp}")
-    if missing_ts:
-        print(f"  WARNING: ts ops not on platform: {missing_ts}")
-
-    print(f"  Backfill ops  ({len(backfill)}): {backfill}")
-    print(f"  Compare ops   ({len(compare)}): {compare}")
-    print(f"  TS ops        ({len(ts)}): {ts}")
+    print(f"  Backfill ({len(backfill)}): {backfill}")
+    print(f"  Compare  ({len(compare)}): {compare}")
+    print(f"  TS       ({len(ts)}): {ts}")
     return backfill, compare, ts
 
 
 def build_expression(
-    pos_field: str,
-    neg_field: str,
-    backfill_op: str,
-    compare_op: str,
-    ts_op: str,
-    days_rank: int,
-    days_final: int,
+    pos_field: str, neg_field: str,
+    backfill_op: str, compare_op: str, ts_op: str,
+    days_rank: int, days_final: int,
 ) -> str:
-    """Build an alpha expression from the template."""
-    lines = [
+    return "\n".join([
         f"positive_sentiment = rank({backfill_op}({pos_field}, {days_rank}));",
         f"negative_sentiment = rank({backfill_op}({neg_field}, {days_rank}));",
         f"sentiment_difference = {compare_op}(positive_sentiment, negative_sentiment);",
-        f"{ts_op}(sentiment_difference, {days_final})",
-    ]
-    return "\n".join(lines)
+        f"group_neutralize({ts_op}(sentiment_difference, {days_final}), industry)",
+    ])
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate sentiment alpha combinations")
+    parser.add_argument("--region", default=None, help="Region (e.g. USA, HKG)")
+    parser.add_argument("--universe", default=None, help="Universe (e.g. TOP3000, TOP500)")
+    parser.add_argument("--delay", type=int, default=None, help="Delay (0 or 1)")
+    args = parser.parse_args()
+
     s = start_session()
 
-    # 1. Get sentiment fields
-    positive_fields, negative_fields = get_sentiment_fields(s)
-    if not positive_fields or not negative_fields:
-        print("ERROR: Could not find both positive and negative sentiment fields. Exiting.")
-        sys.exit(1)
-
-    # 2. Validate operators
-    backfill_ops, compare_ops, ts_ops = get_filtered_operators(s)
-    if not backfill_ops or not compare_ops or not ts_ops:
-        print("ERROR: Missing operator categories. Exiting.")
-        sys.exit(1)
-
-    # 3. Count combinations
-    total = (
-        len(positive_fields)
-        * len(negative_fields)
-        * len(backfill_ops)
-        * len(compare_ops)
-        * len(ts_ops)
-        * len(DAYS)  # days_rank
-        * len(DAYS)  # days_final
+    region, universe, delay = pick_region_universe_delay(
+        s,
+        default_region=args.region or "USA",
+        default_universe=args.universe or "TOP3000",
+        default_delay=args.delay if args.delay is not None else 1,
     )
 
-    # Number of files = len(DAYS) * len(compare_ops)
+    settings = build_settings(region=region, universe=universe, delay=delay)
+    output_dir = alphas_dir_for("sentiment", settings)
+
+    positive_fields, negative_fields = get_sentiment_fields(s, region, universe)
+    if not positive_fields or not negative_fields:
+        print("ERROR: Could not find both positive and negative sentiment fields.")
+        sys.exit(1)
+
+    backfill_ops, compare_ops, ts_ops = get_filtered_operators(s)
+    if not backfill_ops or not compare_ops or not ts_ops:
+        print("ERROR: Missing operator categories.")
+        sys.exit(1)
+
+    total = (
+        len(positive_fields) * len(negative_fields)
+        * len(backfill_ops) * len(compare_ops) * len(ts_ops)
+        * len(DAYS) * len(DAYS)
+    )
     num_files = len(DAYS) * len(compare_ops)
-    alphas_per_file = total // num_files if num_files > 0 else total
 
     print(f"\n{'='*60}")
     print(f"  Sentiment Alpha Generator")
     print(f"{'='*60}")
-    print(f"  Positive fields : {len(positive_fields)}")
-    print(f"  Negative fields : {len(negative_fields)}")
-    print(f"  Backfill ops    : {len(backfill_ops)}")
-    print(f"  Compare ops     : {len(compare_ops)}")
-    print(f"  TS ops          : {len(ts_ops)}")
-    print(f"  Days variants   : {DAYS}")
-    print(f"  Total alphas    : {total:,}")
-    print(f"  Output files    : {num_files} files in {OUTPUT_DIR}/")
-    print(f"  ~Alphas/file    : {alphas_per_file:,}")
+    print(f"  Region / Universe : {region} / {universe}  delay={delay}")
+    print(f"  Positive fields   : {len(positive_fields)}")
+    print(f"  Negative fields   : {len(negative_fields)}")
+    print(f"  Backfill ops      : {len(backfill_ops)}")
+    print(f"  Compare ops       : {len(compare_ops)}")
+    print(f"  TS ops            : {len(ts_ops)}")
+    print(f"  Days              : {DAYS}")
+    print(f"  Total alphas      : {total:,}")
+    print(f"  Output files      : {num_files} files in {output_dir}/")
     print(f"{'='*60}\n")
-
-    # 4. Generate and write split by (days_rank, compare_op)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print("Generating alpha expressions...")
     grand_total = 0
@@ -239,37 +189,26 @@ def main():
 
     for d_rank in DAYS:
         for cmp_op in compare_ops:
-            filename = f"d{d_rank:03d}_{cmp_op}.jsonl"
-            filepath = os.path.join(OUTPUT_DIR, filename)
-            file_count = 0
+            output_path = f"{output_dir}/d{d_rank:03d}_{cmp_op}.jsonl"
 
-            with open(filepath, "w") as f:
+            def _expressions(d_rank=d_rank, cmp_op=cmp_op):
                 for pos, neg, bf_op, ts_op, d_final in itertools.product(
-                    positive_fields,
-                    negative_fields,
-                    backfill_ops,
-                    ts_ops,
-                    DAYS,
+                    positive_fields, negative_fields, backfill_ops, ts_ops, DAYS
                 ):
-                    expr = build_expression(pos, neg, bf_op, cmp_op, ts_op, d_rank, d_final)
-                    alpha = generate_alpha(regular=expr)
-                    f.write(json.dumps(alpha) + "\n")
-                    file_count += 1
+                    yield build_expression(pos, neg, bf_op, cmp_op, ts_op, d_rank, d_final)
 
-                    if example_expr is None:
-                        example_expr = expr
+            exprs = list(_expressions())
+            count = write_alphas_jsonl(iter(exprs), output_path)
+            grand_total += count
+            print(f"  {output_path:55s} -> {count:>8,} alphas")
 
-            grand_total += file_count
-            print(f"  {filename:30s} -> {file_count:>8,} alphas")
+            if example_expr is None and exprs:
+                example_expr = exprs[0]
 
-    print(f"\nDone! {grand_total:,} alphas across {num_files} files in {OUTPUT_DIR}/")
-
-    # 5. Show example
+    print(f"\nDone! {grand_total:,} alphas in {num_files} files → {output_dir}/")
     if example_expr:
-        print(f"\nExample expression (first alpha):\n")
-        print(example_expr)
-
-    print(f"\nNext: python3 sentiment_alpha_simulator.py --input {OUTPUT_DIR}/d005_subtract.jsonl")
+        print(f"\nExample expression:\n{example_expr}")
+    print(f"\nNext: python3 sentiment_alpha_simulator.py --input {output_dir}/d005_subtract.jsonl")
 
 
 if __name__ == "__main__":

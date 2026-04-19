@@ -1094,6 +1094,21 @@ def set_alpha_properties(
     return response
 
 
+def submit_alpha(s: SingleSession, alpha_id: str) -> requests.Response:
+    """
+    Submit an alpha for production consideration.
+
+    Args:
+        s (SingleSession): An authenticated session object.
+        alpha_id (str): The ID of the alpha to submit.
+
+    Returns:
+        requests.Response: The response object from the API call.
+    """
+    result = s.post(brain_api_url + "/alphas/" + alpha_id + "/submit")
+    return result
+
+
 def _get_alpha_pnl(
     s: SingleSession,
     alpha_id: str,
